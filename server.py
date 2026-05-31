@@ -16,6 +16,52 @@ PORT = 8000
 DB_FILE = "jobs.db"
 LOCK = threading.Lock()
 
+# Verified Premium Visa Sponsors ATS Board Mappings (tenant/token mappings)
+PRESEED_ATS_MAPPINGS = [
+    ("Lloyds Banking Group", "workday", "lloydsbankinggroup", "lloydscareers"),
+    ("Barclays", "workday", "barclays", "Barclays_Careers"),
+    ("PricewaterhouseCoopers", "workday", "pwc", "PwC_Careers"),
+    ("Monzo Bank", "greenhouse", "monzo", "monzo"),
+    ("Deliveroo", "greenhouse", "deliveroo", "deliveroo"),
+    ("Revolut", "lever", "revolut", "revolut"),
+    ("Wise", "greenhouse", "transferwise", "transferwise"),
+    ("Starling Bank", "greenhouse", "starlingbank", "starlingbank"),
+    ("Snyk", "greenhouse", "snyk", "snyk"),
+    ("Checkout.com", "greenhouse", "checkout", "checkout"),
+    ("Improbable", "greenhouse", "improbable", "improbable"),
+    ("Skyscanner", "greenhouse", "skyscanner", "skyscanner"),
+    ("Gousto", "greenhouse", "gousto", "gousto"),
+    ("Gymshark", "greenhouse", "gymshark", "gymshark"),
+    ("Curve", "greenhouse", "curve", "curve"),
+    ("Cleo", "greenhouse", "cleo", "cleo"),
+    ("Octopus Energy", "greenhouse", "octopusenergy", "octopusenergy"),
+    ("DeepMind", "greenhouse", "deepmind", "deepmind"),
+    ("Graphcore", "greenhouse", "graphcore", "graphcore"),
+    ("TrueLayer", "greenhouse", "truelayer", "truelayer"),
+    ("Zego", "greenhouse", "zego", "zego"),
+    ("Marshmallow", "greenhouse", "marshmallow", "marshmallow"),
+    ("Farewill", "greenhouse", "farewill", "farewill"),
+    ("Bloom & Wild", "greenhouse", "bloomandwild", "bloomandwild"),
+    ("Paddle", "greenhouse", "paddle", "paddle"),
+    ("Motorway", "greenhouse", "motorway", "motorway"),
+    ("Depop", "greenhouse", "depop", "depop"),
+    ("Lyst", "greenhouse", "lyst", "lyst"),
+    ("Trainline", "greenhouse", "trainline", "trainline"),
+    ("Zilch", "greenhouse", "zilch", "zilch"),
+    ("Thought Machine", "greenhouse", "thoughtmachine", "thoughtmachine"),
+    ("PrimaryBid", "greenhouse", "primarybid", "primarybid"),
+    ("Wayve", "greenhouse", "wayve", "wayve"),
+    ("Synthesia", "greenhouse", "synthesia", "synthesia"),
+    ("Onfido", "greenhouse", "onfido", "onfido"),
+    ("ComplyAdvantage", "greenhouse", "complyadvantage", "complyadvantage"),
+    ("Multiverse", "greenhouse", "multiverse", "multiverse"),
+    ("Snowplow", "greenhouse", "snowplow", "snowplow"),
+    ("Faculty", "greenhouse", "faculty", "faculty"),
+    ("Signal AI", "greenhouse", "signalai", "signalai"),
+    ("Healx", "greenhouse", "healx", "healx"),
+    ("BrewDog", "greenhouse", "brewdog", "brewdog")
+]
+
 def clean_value(val):
     if not val:
         return ""
@@ -75,6 +121,17 @@ def db_init():
     )
     """)
     
+    # 4. Create sponsor_ats_mappings table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS sponsor_ats_mappings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_name TEXT UNIQUE,
+        ats_type TEXT,
+        ats_tenant TEXT,
+        ats_token TEXT
+    )
+    """)
+    
     # Indexes for ultra-fast query execution
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_sponsors_name ON sponsors(organisation_name COLLATE NOCASE)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_sponsors_city ON sponsors(town_city COLLATE NOCASE)")
@@ -85,6 +142,16 @@ def db_init():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_loc ON jobs(location COLLATE NOCASE)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_company ON jobs(company_name)")
     
+    # Pre-seed premium mappings
+    for name, ats_type, tenant, token in PRESEED_ATS_MAPPINGS:
+        try:
+            cursor.execute("""
+            INSERT OR IGNORE INTO sponsor_ats_mappings (company_name, ats_type, ats_tenant, ats_token)
+            VALUES (?, ?, ?, ?)
+            """, (name, ats_type, tenant, token))
+        except Exception:
+            pass
+            
     conn.commit()
     conn.close()
 
@@ -133,7 +200,6 @@ def auto_discover_careers_url(company_name, city):
         cleaned = query.lower().replace(" ", "")
         domain = f"{cleaned}.co.uk"
         
-    # Construct careers page candidate URLs
     candidates = [
         f"https://{domain}/careers",
         f"https://{domain}/jobs",
@@ -156,8 +222,56 @@ def auto_discover_careers_url(company_name, city):
     return f"https://{domain}/careers"
 
 # ---------------------------------------------------------------------------
-# "SPONSOR WEB RADAR" AUTOMATED CRAWLER (HYBRID SPIDER)
+# "SPONSOR WEB RADAR" MULTI-ATS CRAWLER (HYBRID JSON & HTML SPIDER)
 # ---------------------------------------------------------------------------
+
+def crawl_workday(company_name, tenant, board, sponsor_id=None):
+    """Crawls active jobs directly from Workday JSON Search API, retrieving 100% of open vacancies."""
+    url = f"https://{tenant}.wd3.myworkdayjobs.com/wday/cxs/{tenant}/{board}/jobs"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+    }
+    # Fetch up to 100 jobs per company in a single structured request
+    payload = json.dumps({"appliedFacets": {}, "limit": 100, "offset": 0, "searchText": ""}).encode('utf-8')
+    jobs_added = 0
+    
+    try:
+        req = urllib.request.Request(url, data=payload, headers=headers, method='POST')
+        with urllib.request.urlopen(req, timeout=15) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            
+        job_postings = data.get("jobPostings", [])
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        today_str = datetime.date.today().isoformat()
+        
+        for item in job_postings:
+            raw_id = f"workday-{tenant}-{item.get('bulletinNumber', item.get('workdayJobId', ''))}"
+            title = clean_value(item.get("title", ""))
+            
+            # Construct the absolute application URL
+            ext_path = item.get("externalPath", "")
+            job_url = f"https://{tenant}.wd3.myworkdayjobs.com/{board}{ext_path}"
+            
+            location = item.get("locationsText", "UK")
+            # Filter only UK based roles
+            if any(non_uk in location.lower() for non_uk in ["usa", "canada", "germany", "france", "india"]) and "united kingdom" not in location.lower() and "london" not in location.lower():
+                continue
+                
+            cursor.execute("""
+            INSERT OR REPLACE INTO jobs (sponsor_id, company_name, job_title, department, location, job_url, posted_date, source, raw_id)
+            VALUES (?, ?, ?, 'Corporate', ?, ?, ?, 'Workday API', ?)
+            """, (sponsor_id, company_name, title, location, job_url, today_str, raw_id))
+            jobs_added += 1
+            
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[Workday Scraper] Direct crawl failed for '{company_name}': {e}")
+        
+    return jobs_added
 
 def crawl_greenhouse(company_name, token, sponsor_id=None):
     """Crawls active jobs from Greenhouse Board API."""
@@ -254,6 +368,15 @@ def scrape_company_careers_page_smart(company_name, careers_url, sponsor_id=None
             if jobs_added > 0:
                 return jobs_added
                 
+        # Check Workday matches in raw HTML redirect rules
+        wd_matches = re.findall(r'([a-zA-Z0-9_\-]+)\.wd3\.myworkdayjobs\.com/([a-zA-Z0-9_\-]+)', html)
+        if wd_matches:
+            tenant, board = wd_matches[0]
+            print(f"[Smart Scraper] Auto-detected Workday embed '{tenant}/{board}' for: {company_name}")
+            jobs_added = crawl_workday(company_name, tenant, board, sponsor_id)
+            if jobs_added > 0:
+                return jobs_added
+                
         parsed_base = urllib.parse.urlparse(careers_url)
         base_domain = f"{parsed_base.scheme}://{parsed_base.netloc}"
         
@@ -323,7 +446,7 @@ def scrape_company_careers_page_smart(company_name, careers_url, sponsor_id=None
     return 0
 
 # ---------------------------------------------------------------------------
-# AUTOMATED BATCH SYNC DAEMON PIPELINES
+# BACKGROUND SYNC DAEMONS
 # ---------------------------------------------------------------------------
 
 def run_sponsors_sync():
@@ -446,13 +569,41 @@ def run_sponsors_sync():
         return False
 
 def auto_crawl_sponsor_batch():
-    """Background Daemon Batch Scraper: Resolves career URLs and crawls jobs in efficient batches of 50 sponsors, preventing timeouts."""
+    """Background Daemon Batch Scraper: Resolves career URLs and crawls jobs in efficient batches, supporting Workday, Greenhouse, and Lever JSON crawls."""
     db_init()
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
-    # 1. Fetch 50 active sponsors without live vacancies, prioritising ones in popular cities
-    # (London, Manchester, Birmingham, Leeds, Edinburgh, etc.) to get highest yield first!
+    # 1. First, check if there are any pre-seeded ATS board mappings we haven't scraped yet
+    cursor.execute("""
+    SELECT m.company_name, m.ats_type, m.ats_tenant, m.ats_token, s.id 
+    FROM sponsor_ats_mappings m
+    LEFT JOIN sponsors s ON s.organisation_name LIKE '%' || m.company_name || '%' AND s.status != 'Removed'
+    WHERE m.company_name NOT IN (SELECT DISTINCT company_name FROM jobs WHERE source IN ('Workday API', 'Greenhouse API', 'Lever API'))
+    LIMIT 15
+    """)
+    ats_seeds = cursor.fetchall()
+    
+    if ats_seeds:
+        print(f"[Crawler Batch] Found {len(ats_seeds)} pre-seeded high-yield ATS mappings to crawl...")
+        total_seeded = 0
+        for name, ats_type, tenant, token, sp_id in ats_seeds:
+            print(f"[Crawler Batch] Direct JSON API Crawl: {name} ({ats_type})")
+            if ats_type == "workday":
+                count = crawl_workday(name, tenant, token, sp_id)
+            elif ats_type == "greenhouse":
+                count = crawl_greenhouse(name, token, sp_id)
+            elif ats_type == "lever":
+                count = crawl_lever(name, token, sp_id)
+            else:
+                count = 0
+            total_seeded += count
+            time.sleep(0.5)
+        print(f"[Crawler Batch] Pre-seed API crawl complete! Indexed {total_seeded} vacancies.")
+        conn.close()
+        return total_seeded
+        
+    # 2. General Fallback: Fetch 40 sponsors without live vacancies, prioritizing popular cities
     cursor.execute("""
     SELECT id, organisation_name, town_city, careers_url 
     FROM sponsors 
@@ -461,7 +612,7 @@ def auto_crawl_sponsor_batch():
         WHEN UPPER(town_city) IN ('LONDON', 'MANCHESTER', 'BIRMINGHAM', 'LEEDS', 'EDINBURGH', 'GLASGOW', 'BRISTOL', 'CAMBRIDGE', 'OXFORD') THEN 0
         ELSE 1 
     END ASC, id ASC
-    LIMIT 50
+    LIMIT 40
     """)
     sponsors = cursor.fetchall()
     conn.close()
@@ -470,16 +621,14 @@ def auto_crawl_sponsor_batch():
         print("[Crawler Batch] All sponsors have been crawled or database is empty.")
         return 0
         
-    print(f"[Crawler Batch] Starting background crawl batch for {len(sponsors)} companies...")
+    print(f"[Crawler Batch] Starting background HTML crawl batch for {len(sponsors)} companies...")
     total_added = 0
     
     for sp_id, name, city, careers_url in sponsors:
-        # Avoid generic noise names
         name_lower = name.lower()
         if any(noise in name_lower for noise in ["builders", "construction", "learning", "global", "tutorials"]):
             continue
             
-        # Resolve careers URL if missing
         if not careers_url:
             careers_url = auto_discover_careers_url(name, city)
             if careers_url:
@@ -492,11 +641,9 @@ def auto_crawl_sponsor_batch():
         if not careers_url:
             continue
             
-        print(f"[Crawler Batch] Scouting: {name} ({careers_url})")
+        print(f"[Crawler Batch] Scouting HTML: {name} ({careers_url})")
         jobs_count = scrape_company_careers_page_smart(name, careers_url, sp_id)
         total_added += jobs_count
-        
-        # Micro sleep to prevent rapid rate limiting
         time.sleep(0.5)
         
     print(f"[Crawler Batch] Batch completed! Crawled and indexed {total_added} live sponsorship roles.")
@@ -505,7 +652,6 @@ def auto_crawl_sponsor_batch():
 def global_sync_daemon():
     db_init()
     
-    # Initial Sync GOV.UK CSV on startup if DB is dry
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM sponsors")
@@ -516,19 +662,14 @@ def global_sync_daemon():
         print("[Daemon] Core database empty. Seeding official sponsors list...")
         run_sponsors_sync()
         
-    # Standard sync loop
     while True:
         try:
-            # 1. Run incremental sponsor updates check daily
             run_sponsors_sync()
-            
-            # 2. Run automated batch scraper every 5 minutes to continuously build up the jobs index!
-            # Since it indexes 50 companies per batch, it will smoothly index 600 companies every hour!
             auto_crawl_sponsor_batch()
         except Exception as e:
             print(f"[Daemon] Error in background sync loop: {e}")
             
-        time.sleep(300) # Sleep for 5 minutes
+        time.sleep(300)
 
 # ---------------------------------------------------------------------------
 # API ROUTER & CONTROLLER
