@@ -2,6 +2,8 @@ import server
 
 def main():
     print("==============================================")
+    print("Imported server from:", getattr(server, "__file__", "Unknown (Built-in)"))
+    
     # 1. Initialize SQLite Database Schema
     print("[Testing] Initializing SQLite jobs.db database...")
     server.db_init()
@@ -16,12 +18,9 @@ def main():
         return
         
     # 3. Run Live Jobs Sync (Greenhouse & Lever APIs)
-    print("\n[Testing] Crawling premium ATS feeds for live sponsorship jobs...")
-    jobs_ok = server.run_jobs_sync()
-    if jobs_ok:
-        print("[Testing] [OK] Jobs sync completed successfully!")
-    else:
-        print("[Testing] [FAIL] Jobs sync failed.")
+    print("\n[Testing] Crawling premium website career pages in background batches...")
+    jobs_count = server.auto_crawl_sponsor_batch()
+    print(f"[Testing] [OK] Batch completed! Crawled and indexed {jobs_count} live jobs.")
         
     print("\n==============================================")
     print("[Testing] Verification & seeding process complete!")

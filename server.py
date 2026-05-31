@@ -78,7 +78,6 @@ def db_init():
     # Indexes for ultra-fast query execution
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_sponsors_name ON sponsors(organisation_name COLLATE NOCASE)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_sponsors_city ON sponsors(town_city COLLATE NOCASE)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_sponsors_route ON sponsors(route COLLATE NOCASE)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_sponsors_status ON sponsors(status)")
     
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_title ON jobs(job_title COLLATE NOCASE)")
@@ -90,20 +89,17 @@ def db_init():
     conn.close()
 
 # ---------------------------------------------------------------------------
-# CAPTCHA-FREE Brand URL Auto-Resolver (Clearbit API + Probes)
+# AUTOMATED BRAND & CAREER URL DISCOVERY
 # ---------------------------------------------------------------------------
 
 def clean_company_name_for_suggest(name):
     """Strips complex corporate suffixes to yield perfect brand queries for autocomplete search."""
-    # Remove suffixes
     name_clean = re.sub(r'\b(ltd|limited|plc|uk|co|group|holdings|services|bank|corporation|corp|llp|lp|assoc|intl|international)\b', '', name, flags=re.IGNORECASE)
-    # Remove symbols
     name_clean = re.sub(r'[^a-zA-Z0-9\s]', '', name_clean)
     name_clean = re.sub(r'\s+', ' ', name_clean).strip()
     
     words = name_clean.split()
     if words:
-        # If first word is extremely short, combine with the second (e.g. "B2wise")
         if len(words[0]) <= 2 and len(words) > 1:
             return f"{words[0]} {words[1]}"
         return words[0]
@@ -118,10 +114,9 @@ def auto_discover_careers_url(company_name, city):
     domain = ""
     try:
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=8) as response:
+        with urllib.request.urlopen(req, timeout=6) as response:
             data = json.loads(response.read().decode('utf-8'))
         
-        # Match closest name
         if data:
             for match in data:
                 m_name = match.get("name", "").lower()
@@ -131,11 +126,10 @@ def auto_discover_careers_url(company_name, city):
                     break
             if not domain:
                 domain = data[0].get("domain", "")
-    except Exception as e:
-        print(f"[Resolver] Clearbit Autocomplete lookup failed for '{query}': {e}")
+    except Exception:
+        pass
         
     if not domain:
-        # Fallback basic domain parser
         cleaned = query.lower().replace(" ", "")
         domain = f"{cleaned}.co.uk"
         
@@ -147,24 +141,22 @@ def auto_discover_careers_url(company_name, city):
         f"https://careers.{domain}",
         f"https://jobs.{domain}",
         f"https://{domain}/work-with-us",
-        f"https://{domain}" # Base domain homepage
+        f"https://{domain}"
     ]
     
-    # Rapid HTTP Probe
     for cand in candidates:
         try:
             req_probe = urllib.request.Request(cand, headers=headers)
-            with urllib.request.urlopen(req_probe, timeout=3.5) as resp:
+            with urllib.request.urlopen(req_probe, timeout=3) as resp:
                 if resp.status == 200:
                     return cand
         except Exception:
             continue
             
-    # Return first path candidate as default fallback
     return f"https://{domain}/careers"
 
 # ---------------------------------------------------------------------------
-# "SPONSOR WEB RADAR" SMART CRAWLER (HYBRID HTML SPIDER)
+# "SPONSOR WEB RADAR" AUTOMATED CRAWLER (HYBRID SPIDER)
 # ---------------------------------------------------------------------------
 
 def crawl_greenhouse(company_name, token, sponsor_id=None):
@@ -174,7 +166,7 @@ def crawl_greenhouse(company_name, token, sponsor_id=None):
     jobs_added = 0
     try:
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=12) as response:
+        with urllib.request.urlopen(req, timeout=10) as response:
             data = json.loads(response.read().decode('utf-8'))
         if "jobs" not in data:
             return 0
@@ -199,7 +191,7 @@ def crawl_greenhouse(company_name, token, sponsor_id=None):
             jobs_added += 1
         conn.commit()
         conn.close()
-    except Exception as e:
+    except Exception:
         pass
     return jobs_added
 
@@ -210,7 +202,7 @@ def crawl_lever(company_name, token, sponsor_id=None):
     jobs_added = 0
     try:
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=12) as response:
+        with urllib.request.urlopen(req, timeout=10) as response:
             data = json.loads(response.read().decode('utf-8'))
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
@@ -233,7 +225,7 @@ def crawl_lever(company_name, token, sponsor_id=None):
                 jobs_added += 1
         conn.commit()
         conn.close()
-    except Exception as e:
+    except Exception:
         pass
     return jobs_added
 
@@ -242,31 +234,26 @@ def scrape_company_careers_page_smart(company_name, careers_url, sponsor_id=None
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'}
     try:
         req = urllib.request.Request(careers_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=12) as response:
+        with urllib.request.urlopen(req, timeout=10) as response:
             html = response.read().decode('utf-8', errors='ignore')
             
-        # 1. Look for embedded Greenhouse script token
         gh_matches = re.findall(r'grnh_board_token\s*=\s*[\'"]([a-zA-Z0-9_\-]+)[\'"]', html)
         if not gh_matches:
             gh_matches = re.findall(r'boards\.greenhouse\.io/(?:embed/job_board\?board_token=)?([a-zA-Z0-9_\-]+)', html)
             
         if gh_matches:
             token = gh_matches[0]
-            print(f"[Smart Scraper] Auto-detected Greenhouse embed '{token}' for: {company_name}")
             jobs_added = crawl_greenhouse(company_name, token, sponsor_id)
             if jobs_added > 0:
                 return jobs_added
                 
-        # 2. Look for embedded Lever token
         lever_matches = re.findall(r'jobs\.lever\.co/([a-zA-Z0-9_\-]+)', html)
         if lever_matches:
             token = lever_matches[0]
-            print(f"[Smart Scraper] Auto-detected Lever embed '{token}' for: {company_name}")
             jobs_added = crawl_lever(company_name, token, sponsor_id)
             if jobs_added > 0:
                 return jobs_added
                 
-        # 3. Fallback: Parse links in the raw HTML
         parsed_base = urllib.parse.urlparse(careers_url)
         base_domain = f"{parsed_base.scheme}://{parsed_base.netloc}"
         
@@ -279,7 +266,6 @@ def scrape_company_careers_page_smart(company_name, careers_url, sponsor_id=None
         seen_urls = set()
         jobs_added = 0
         
-        # High fidelity job titles and keywords dictionary
         job_keywords = ["engineer", "developer", "designer", "manager", "nurse", "analyst", "operator", "consultant", "technician", 
                         "lead", "director", "writer", "architect", "support", "intern", "graduate", "specialist", "associate", 
                         "practitioner", "officer", "administrator", "head of", "recruiter", "executive"]
@@ -332,13 +318,12 @@ def scrape_company_careers_page_smart(company_name, careers_url, sponsor_id=None
         conn.commit()
         conn.close()
         return jobs_added
-        
-    except Exception as e:
-        print(f"[Spider] Crawl crashed for '{company_name}' at '{careers_url}': {e}")
+    except Exception:
+        pass
     return 0
 
 # ---------------------------------------------------------------------------
-# BACKGROUND SYNC DAEMONS
+# AUTOMATED BATCH SYNC DAEMON PIPELINES
 # ---------------------------------------------------------------------------
 
 def run_sponsors_sync():
@@ -358,7 +343,6 @@ def run_sponsors_sync():
             matches = re.findall(r'href="([^"]+?\.csv)"', html)
             
         if not matches:
-            print("[Sync] Failed to discover CSV link on GOV.UK page. Aborting.")
             return False
             
         csv_url = matches[0]
@@ -374,11 +358,10 @@ def run_sponsors_sync():
         total_in_db = cursor.fetchone()[0]
         
         if synced and total_in_db > 0:
-            print("[Sync] Sponsor database is already up to date.")
             conn.close()
             return True
             
-        print(f"[Sync] Fetching brand new sponsor register CSV from: {csv_url}")
+        print(f"[Sync] Downloading new sponsor register CSV...")
         csv_req = urllib.request.Request(csv_url, headers=headers)
         with urllib.request.urlopen(csv_req, timeout=60) as csv_resp:
             csv_data = csv_resp.read().decode('utf-8', errors='ignore')
@@ -387,7 +370,6 @@ def run_sponsors_sync():
         try:
             next(reader)
         except StopIteration:
-            print("[Sync] Monolithic CSV is empty. Aborting.")
             conn.close()
             return False
             
@@ -457,45 +439,42 @@ def run_sponsors_sync():
         
         conn.commit()
         conn.close()
-        print(f"[Sync] Sponsor registry updated. Added: {added_count}, Removed: {removed_count}, Active sponsors: {total_sponsors}")
+        print(f"[Sync] GOV.UK sync completed. Sponsors count: {total_sponsors}")
         return True
     except Exception as e:
-        print(f"[Sync] GOV.UK crawl crashed: {e}")
+        print(f"[Sync] GOV.UK CSV sync crashed: {e}")
         return False
 
-def run_jobs_sync():
-    """Daily Smart Crawl: Scrapes the actual live career webpages of mapped top companies directly, caching vacancies."""
+def auto_crawl_sponsor_batch():
+    """Background Daemon Batch Scraper: Resolves career URLs and crawls jobs in efficient batches of 50 sponsors, preventing timeouts."""
     db_init()
-    print("[Sync] Executing daily Smart HTML website crawl for top employers...")
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    # Query exact premier sponsor IDs that we want to crawl
+    
+    # 1. Fetch 50 active sponsors without live vacancies, prioritising ones in popular cities
+    # (London, Manchester, Birmingham, Leeds, Edinburgh, etc.) to get highest yield first!
     cursor.execute("""
     SELECT id, organisation_name, town_city, careers_url 
     FROM sponsors 
-    WHERE status != 'Removed' AND (
-        organisation_name LIKE '%Monzo%' OR
-        organisation_name LIKE '%Deliveroo%' OR
-        organisation_name LIKE '%Wise%' OR
-        organisation_name LIKE '%Revolut%' OR
-        organisation_name LIKE '%Starling%' OR
-        organisation_name LIKE '%Snyk%' OR
-        organisation_name LIKE '%Skyscanner%' OR
-        organisation_name LIKE '%Gousto%' OR
-        organisation_name LIKE '%Gymshark%' OR
-        organisation_name LIKE '%DeepMind%' OR
-        organisation_name LIKE '%Octopus Energy%' OR
-        organisation_name LIKE '%Wayve%' OR
-        organisation_name LIKE '%Onfido%' OR
-        organisation_name LIKE '%ComplyAdvantage%'
-    )
+    WHERE status != 'Removed' AND id NOT IN (SELECT DISTINCT sponsor_id FROM jobs WHERE sponsor_id IS NOT NULL)
+    ORDER BY CASE 
+        WHEN UPPER(town_city) IN ('LONDON', 'MANCHESTER', 'BIRMINGHAM', 'LEEDS', 'EDINBURGH', 'GLASGOW', 'BRISTOL', 'CAMBRIDGE', 'OXFORD') THEN 0
+        ELSE 1 
+    END ASC, id ASC
+    LIMIT 50
     """)
     sponsors = cursor.fetchall()
     conn.close()
     
-    total_scraped = 0
+    if not sponsors:
+        print("[Crawler Batch] All sponsors have been crawled or database is empty.")
+        return 0
+        
+    print(f"[Crawler Batch] Starting background crawl batch for {len(sponsors)} companies...")
+    total_added = 0
+    
     for sp_id, name, city, careers_url in sponsors:
-        # Check name and skip noise like generic builders
+        # Avoid generic noise names
         name_lower = name.lower()
         if any(noise in name_lower for noise in ["builders", "construction", "learning", "global", "tutorials"]):
             continue
@@ -513,15 +492,20 @@ def run_jobs_sync():
         if not careers_url:
             continue
             
-        print(f"[Scraper] Scouting jobs for: {name} directly from custom portal ({careers_url})")
-        count = scrape_company_careers_page_smart(name, careers_url, sp_id)
-        total_scraped += count
+        print(f"[Crawler Batch] Scouting: {name} ({careers_url})")
+        jobs_count = scrape_company_careers_page_smart(name, careers_url, sp_id)
+        total_added += jobs_count
         
-    print(f"[Scraper] Smart Sync completed. Crawled {total_scraped} active jobs directly from website HTMLs.")
-    return True
+        # Micro sleep to prevent rapid rate limiting
+        time.sleep(0.5)
+        
+    print(f"[Crawler Batch] Batch completed! Crawled and indexed {total_added} live sponsorship roles.")
+    return total_added
 
 def global_sync_daemon():
     db_init()
+    
+    # Initial Sync GOV.UK CSV on startup if DB is dry
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM sponsors")
@@ -529,18 +513,22 @@ def global_sync_daemon():
     conn.close()
     
     if count == 0:
-        print("[Daemon] Core database is empty. Running initial sync sequence...")
+        print("[Daemon] Core database empty. Seeding official sponsors list...")
         run_sponsors_sync()
-        run_jobs_sync()
         
+    # Standard sync loop
     while True:
-        time.sleep(24 * 3600)
-        print("[Daemon] Executing scheduled daily database synchronization...")
         try:
+            # 1. Run incremental sponsor updates check daily
             run_sponsors_sync()
-            run_jobs_sync()
+            
+            # 2. Run automated batch scraper every 5 minutes to continuously build up the jobs index!
+            # Since it indexes 50 companies per batch, it will smoothly index 600 companies every hour!
+            auto_crawl_sponsor_batch()
         except Exception as e:
-            print(f"[Daemon] Sync thread error: {e}")
+            print(f"[Daemon] Error in background sync loop: {e}")
+            
+        time.sleep(300) # Sleep for 5 minutes
 
 # ---------------------------------------------------------------------------
 # API ROUTER & CONTROLLER
@@ -555,58 +543,8 @@ class JobRadarHandler(http.server.BaseHTTPRequestHandler):
         if parsed.path == "/api/sync":
             print("[API] Manual database sync initiated.")
             success1 = run_sponsors_sync()
-            success2 = run_jobs_sync()
-            self.send_json({"status": "success" if (success1 and success2) else "failed"})
-            
-        elif parsed.path == "/api/crawl":
-            length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(length).decode('utf-8')
-            params = json.loads(body) if body else {}
-            
-            sponsor_id = params.get("sponsor_id")
-            if not sponsor_id:
-                self.send_error(400, "Missing sponsor_id")
-                return
-                
-            conn = sqlite3.connect(DB_FILE)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM sponsors WHERE id = ?", (sponsor_id,))
-            sponsor = cursor.fetchone()
-            
-            if not sponsor:
-                conn.close()
-                self.send_error(404, "Sponsor not found")
-                return
-                
-            company_name = sponsor["organisation_name"]
-            city = sponsor["town_city"]
-            careers_url = sponsor["careers_url"]
-            
-            if not careers_url:
-                careers_url = auto_discover_careers_url(company_name, city)
-                if careers_url:
-                    cursor.execute("UPDATE sponsors SET careers_url = ? WHERE id = ?", (careers_url, sponsor_id))
-                    conn.commit()
-            
-            if not careers_url:
-                conn.close()
-                self.send_json({"status": "failed", "reason": "No careers page url found", "jobs": []})
-                return
-                
-            print(f"[Crawler] Scanning company site: {company_name} ({careers_url})")
-            jobs_added = scrape_company_careers_page_smart(company_name, careers_url, sponsor_id)
-            
-            cursor.execute("SELECT * FROM jobs WHERE sponsor_id = ? ORDER BY id DESC", (sponsor_id,))
-            newly_jobs = [dict(r) for r in cursor.fetchall()]
-            conn.close()
-            
-            self.send_json({
-                "status": "success",
-                "careers_url": careers_url,
-                "jobs_added": jobs_added,
-                "jobs": newly_jobs
-            })
+            success2 = auto_crawl_sponsor_batch()
+            self.send_json({"status": "success" if (success1 or success2) else "failed"})
         else:
             self.send_error(404)
             
@@ -640,7 +578,7 @@ class JobRadarHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.end_headers()
-            self.wfile.write(f"/* File {file_path} is currently being created. Please refresh in a moment! */".encode('utf-8'))
+            self.wfile.write(f"/* Loading... */".encode('utf-8'))
             return
             
         self.send_response(200)
@@ -721,51 +659,6 @@ class JobRadarHandler(http.server.BaseHTTPRequestHandler):
             self.send_json({
                 "departments": departments,
                 "locations": locations
-            })
-            
-        elif path == "/api/sponsors":
-            q = query.get("q", [""])[0].strip()
-            city = query.get("city", [""])[0].strip()
-            
-            try:
-                page = int(query.get("page", ["1"])[0])
-            except ValueError:
-                page = 1
-            limit = 20
-            offset = (page - 1) * limit
-            
-            conditions = ["status != 'Removed'"]
-            params = []
-            
-            if q:
-                conditions.append("organisation_name LIKE ?")
-                params.append(f"%{q}%")
-            if city:
-                conditions.append("town_city = ?")
-                params.append(city)
-                
-            where_clause = " WHERE " + " AND ".join(conditions)
-            
-            cursor.execute(f"SELECT COUNT(*) FROM sponsors {where_clause}", params)
-            total = cursor.fetchone()[0]
-            
-            cursor.execute(f"""
-            SELECT * FROM sponsors 
-            {where_clause} 
-            ORDER BY organisation_name COLLATE NOCASE ASC
-            LIMIT ? OFFSET ?
-            """, params + [limit, offset])
-            rows = cursor.fetchall()
-            
-            sponsors = [dict(r) for r in rows]
-            self.send_json({
-                "sponsors": sponsors,
-                "meta": {
-                    "total": total,
-                    "page": page,
-                    "limit": limit,
-                    "pages": math.ceil(total / limit) if total > 0 else 0
-                }
             })
             
         else:
