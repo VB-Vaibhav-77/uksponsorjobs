@@ -18,7 +18,7 @@ LOCK = threading.Lock()
 
 # Verified Premium Visa Sponsors ATS Board Mappings (tenant/token mappings)
 PRESEED_ATS_MAPPINGS = [
-    ("Lloyds Banking Group", "workday", "lloydsbankinggroup", "lloydscareers"),
+    ("Lloyds Banking Group", "workday", "lbg", "LBG_Careers"),
     ("Barclays", "workday", "barclays", "Barclays_Careers"),
     ("PricewaterhouseCoopers", "workday", "pwc", "PwC_Careers"),
     ("Monzo Bank", "greenhouse", "monzo", "monzo"),
@@ -227,49 +227,68 @@ def auto_discover_careers_url(company_name, city):
 
 def crawl_workday(company_name, tenant, board, sponsor_id=None):
     """Crawls active jobs directly from Workday JSON Search API, retrieving 100% of open vacancies."""
-    url = f"https://{tenant}.wd3.myworkdayjobs.com/wday/cxs/{tenant}/{board}/jobs"
+    base_url = f"https://{tenant}.wd3.myworkdayjobs.com/wday/cxs/{tenant}/{board}/jobs"
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
         'Content-Type': 'application/json',
-        'Accept': 'application/json'
+        'Accept': 'application/json',
+        'Origin': f'https://{tenant}.wd3.myworkdayjobs.com',
+        'Referer': f'https://{tenant}.wd3.myworkdayjobs.com/{board}'
     }
-    # Fetch up to 100 jobs per company in a single structured request
-    payload = json.dumps({"appliedFacets": {}, "limit": 100, "offset": 0, "searchText": ""}).encode('utf-8')
+    
+    offset = 0
+    limit = 20
+    total = 1
     jobs_added = 0
     
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    today_str = datetime.date.today().isoformat()
+    
     try:
-        req = urllib.request.Request(url, data=payload, headers=headers, method='POST')
-        with urllib.request.urlopen(req, timeout=15) as response:
-            data = json.loads(response.read().decode('utf-8'))
+        while offset < total and offset < 200: # safety cap at 200 jobs
+            payload = json.dumps({
+                "appliedFacets": {},
+                "limit": limit,
+                "offset": offset,
+                "searchText": ""
+            }).encode('utf-8')
             
-        job_postings = data.get("jobPostings", [])
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        today_str = datetime.date.today().isoformat()
-        
-        for item in job_postings:
-            raw_id = f"workday-{tenant}-{item.get('bulletinNumber', item.get('workdayJobId', ''))}"
-            title = clean_value(item.get("title", ""))
-            
-            # Construct the absolute application URL
-            ext_path = item.get("externalPath", "")
-            job_url = f"https://{tenant}.wd3.myworkdayjobs.com/{board}{ext_path}"
-            
-            location = item.get("locationsText", "UK")
-            # Filter only UK based roles
-            if any(non_uk in location.lower() for non_uk in ["usa", "canada", "germany", "france", "india"]) and "united kingdom" not in location.lower() and "london" not in location.lower():
-                continue
+            req = urllib.request.Request(base_url, data=payload, headers=headers, method='POST')
+            with urllib.request.urlopen(req, timeout=12) as response:
+                data = json.loads(response.read().decode('utf-8'))
                 
-            cursor.execute("""
-            INSERT OR REPLACE INTO jobs (sponsor_id, company_name, job_title, department, location, job_url, posted_date, source, raw_id)
-            VALUES (?, ?, ?, 'Corporate', ?, ?, ?, 'Workday API', ?)
-            """, (sponsor_id, company_name, title, location, job_url, today_str, raw_id))
-            jobs_added += 1
+            total = data.get("total", 0)
+            job_postings = data.get("jobPostings", [])
+            
+            if not job_postings:
+                break
+                
+            for item in job_postings:
+                raw_id = f"workday-{tenant}-{item.get('bulletinNumber', item.get('workdayJobId', ''))}"
+                title = clean_value(item.get("title", ""))
+                
+                ext_path = item.get("externalPath", "")
+                job_url = f"https://{tenant}.wd3.myworkdayjobs.com/{board}{ext_path}"
+                
+                location = item.get("locationsText", "UK")
+                if any(non_uk in location.lower() for non_uk in ["usa", "canada", "germany", "france", "india"]) and "united kingdom" not in location.lower() and "london" not in location.lower():
+                    continue
+                    
+                cursor.execute("""
+                INSERT OR REPLACE INTO jobs (sponsor_id, company_name, job_title, department, location, job_url, posted_date, source, raw_id)
+                VALUES (?, ?, ?, 'Corporate', ?, ?, ?, 'Workday API', ?)
+                """, (sponsor_id, company_name, title, location, job_url, today_str, raw_id))
+                jobs_added += 1
+                
+            offset += limit
+            time.sleep(0.35)
             
         conn.commit()
-        conn.close()
     except Exception as e:
         print(f"[Workday Scraper] Direct crawl failed for '{company_name}': {e}")
+    finally:
+        conn.close()
         
     return jobs_added
 
@@ -368,11 +387,9 @@ def scrape_company_careers_page_smart(company_name, careers_url, sponsor_id=None
             if jobs_added > 0:
                 return jobs_added
                 
-        # Check Workday matches in raw HTML redirect rules
         wd_matches = re.findall(r'([a-zA-Z0-9_\-]+)\.wd3\.myworkdayjobs\.com/([a-zA-Z0-9_\-]+)', html)
         if wd_matches:
             tenant, board = wd_matches[0]
-            print(f"[Smart Scraper] Auto-detected Workday embed '{tenant}/{board}' for: {company_name}")
             jobs_added = crawl_workday(company_name, tenant, board, sponsor_id)
             if jobs_added > 0:
                 return jobs_added
