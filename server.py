@@ -16,49 +16,6 @@ PORT = 8000
 DB_FILE = "jobs.db"
 LOCK = threading.Lock()
 
-PRESEED_ATS_COMPANIES = [
-    ("Monzo", "greenhouse", "monzo"),
-    ("Deliveroo", "greenhouse", "deliveroo"),
-    ("Revolut", "lever", "revolut"),
-    ("Wise", "greenhouse", "transferwise"),
-    ("Starling Bank", "greenhouse", "starlingbank"),
-    ("Snyk", "greenhouse", "snyk"),
-    ("Checkout.com", "greenhouse", "checkout"),
-    ("Improbable", "greenhouse", "improbable"),
-    ("Skyscanner", "greenhouse", "skyscanner"),
-    ("Gousto", "greenhouse", "gousto"),
-    ("Gymshark", "greenhouse", "gymshark"),
-    ("Curve", "greenhouse", "curve"),
-    ("Cleo", "greenhouse", "cleo"),
-    ("Octopus Energy", "greenhouse", "octopusenergy"),
-    ("DeepMind", "greenhouse", "deepmind"),
-    ("Graphcore", "greenhouse", "graphcore"),
-    ("Hadean", "greenhouse", "hadean"),
-    ("TrueLayer", "greenhouse", "truelayer"),
-    ("Zego", "greenhouse", "zego"),
-    ("Marshmallow", "greenhouse", "marshmallow"),
-    ("Farewill", "greenhouse", "farewill"),
-    ("Bloom & Wild", "greenhouse", "bloomandwild"),
-    ("Paddle", "greenhouse", "paddle"),
-    ("Motorway", "greenhouse", "motorway"),
-    ("Depop", "greenhouse", "depop"),
-    ("Lyst", "greenhouse", "lyst"),
-    ("Trainline", "greenhouse", "trainline"),
-    ("Zilch", "greenhouse", "zilch"),
-    ("Thought Machine", "greenhouse", "thoughtmachine"),
-    ("PrimaryBid", "greenhouse", "primarybid"),
-    ("Wayve", "greenhouse", "wayve"),
-    ("Synthesia", "greenhouse", "synthesia"),
-    ("Onfido", "greenhouse", "onfido"),
-    ("ComplyAdvantage", "greenhouse", "complyadvantage"),
-    ("Multiverse", "greenhouse", "multiverse"),
-    ("Snowplow", "greenhouse", "snowplow"),
-    ("Faculty", "greenhouse", "faculty"),
-    ("Signal AI", "greenhouse", "signalai"),
-    ("Healx", "greenhouse", "healx"),
-    ("BrewDog", "greenhouse", "brewdog")
-]
-
 def clean_value(val):
     if not val:
         return ""
@@ -118,16 +75,6 @@ def db_init():
     )
     """)
     
-    # 4. Create sponsor_ats_mappings table
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS sponsor_ats_mappings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        company_name TEXT UNIQUE,
-        ats_type TEXT,
-        ats_token TEXT
-    )
-    """)
-    
     # Indexes for ultra-fast query execution
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_sponsors_name ON sponsors(organisation_name COLLATE NOCASE)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_sponsors_city ON sponsors(town_city COLLATE NOCASE)")
@@ -139,19 +86,8 @@ def db_init():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_loc ON jobs(location COLLATE NOCASE)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_company ON jobs(company_name)")
     
-    # Preseed initial ATS mappings
-    for name, ats_type, token in PRESEED_ATS_COMPANIES:
-        try:
-            cursor.execute("""
-            INSERT OR IGNORE INTO sponsor_ats_mappings (company_name, ats_type, ats_token)
-            VALUES (?, ?, ?)
-            """, (name, ats_type, token))
-        except Exception as e:
-            pass
-            
     conn.commit()
     conn.close()
-    print("[Database] Standalone schema initialized successfully.")
 
 # ---------------------------------------------------------------------------
 # WEB CRAWLER & SEARCH ENGINE UTILITIES
@@ -169,9 +105,7 @@ def search_duckduckgo(query):
         links = re.findall(r'href="([^"]+?)"', html)
         discovered = []
         for link in links:
-            # Skip duckduckgo specific links
             if "duckduckgo.com" not in link and (link.startswith("http://") or link.startswith("https://") or "/l/?kh=-1&uddg=" in link):
-                # Unpack DuckDuckGo redirect link if present
                 if "/l/?kh=-1&uddg=" in link:
                     query_params = urllib.parse.parse_qs(urllib.parse.urlparse(link).query)
                     if "uddg" in query_params:
@@ -187,7 +121,6 @@ def auto_discover_careers_url(company_name, city):
     query = f"{company_name} {city} UK official website careers jobs"
     links = search_duckduckgo(query)
     
-    # Filter social media and third-party links
     filtered_links = []
     for link in links:
         link_lower = link.lower()
@@ -196,7 +129,6 @@ def auto_discover_careers_url(company_name, city):
         filtered_links.append(link)
         
     if filtered_links:
-        # Prefer urls with careers/jobs keywords
         for link in filtered_links:
             if any(k in link.lower() for k in ["career", "job", "work-with-us", "vacancy", "join-us", "position"]):
                 return link
@@ -204,7 +136,7 @@ def auto_discover_careers_url(company_name, city):
     return ""
 
 # ---------------------------------------------------------------------------
-# "SPONSOR WEB RADAR" SPIDER (CRAWLERS)
+# "SPONSOR WEB RADAR" SMART CRAWLER (HYBRID HTML SPIDER)
 # ---------------------------------------------------------------------------
 
 def crawl_greenhouse(company_name, token, sponsor_id=None):
@@ -212,41 +144,23 @@ def crawl_greenhouse(company_name, token, sponsor_id=None):
     url = f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true"
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     jobs_added = 0
-    
     try:
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=15) as response:
+        with urllib.request.urlopen(req, timeout=12) as response:
             data = json.loads(response.read().decode('utf-8'))
-            
         if "jobs" not in data:
             return 0
-            
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        
-        # Pull sponsor_id if not supplied
-        if not sponsor_id:
-            cursor.execute("SELECT id FROM sponsors WHERE organisation_name LIKE ? LIMIT 1", (f"%{company_name}%",))
-            row = cursor.fetchone()
-            sponsor_id = row[0] if row else None
-            
         today_str = datetime.date.today().isoformat()
-        
-        # Save each job
         for item in data["jobs"]:
             raw_id = f"greenhouse-{item['id']}"
             title = clean_value(item.get("title", ""))
             job_url = clean_value(item.get("absolute_url", ""))
-            
-            # Location
             loc_data = item.get("location", {})
             location = loc_data.get("name", "UK") if loc_data else "UK"
-            
-            # Skip if location is explicitly outside UK
-            if any(non_uk in location.lower() for non_uk in ["usa", "canada", "germany", "france", "india", "australia"]) and "united kingdom" not in location.lower() and "london" not in location.lower():
+            if any(non_uk in location.lower() for non_uk in ["usa", "canada", "germany", "france", "india"]) and "united kingdom" not in location.lower() and "london" not in location.lower():
                 continue
-                
-            # Department
             depts = item.get("departments", [])
             department = depts[0].get("name", "General") if depts else "General"
             
@@ -255,12 +169,10 @@ def crawl_greenhouse(company_name, token, sponsor_id=None):
             VALUES (?, ?, ?, ?, ?, ?, ?, 'Greenhouse API', ?)
             """, (sponsor_id, company_name, title, department, location, job_url, today_str, raw_id))
             jobs_added += 1
-            
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"[Spider] Greenhouse crawl failed for '{company_name}': {e}")
-        
+        pass
     return jobs_added
 
 def crawl_lever(company_name, token, sponsor_id=None):
@@ -268,63 +180,65 @@ def crawl_lever(company_name, token, sponsor_id=None):
     url = f"https://api.lever.co/v0/postings/{token}?group=team"
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     jobs_added = 0
-    
     try:
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=15) as response:
+        with urllib.request.urlopen(req, timeout=12) as response:
             data = json.loads(response.read().decode('utf-8'))
-            
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        
-        if not sponsor_id:
-            cursor.execute("SELECT id FROM sponsors WHERE organisation_name LIKE ? LIMIT 1", (f"%{company_name}%",))
-            row = cursor.fetchone()
-            sponsor_id = row[0] if row else None
-            
         today_str = datetime.date.today().isoformat()
-        
-        # Lever response groups postings by team/dept
         for group in data:
             dept_name = group.get("title", "General")
             postings = group.get("postings", [])
-            
             for item in postings:
                 raw_id = f"lever-{item['id']}"
                 title = clean_value(item.get("title", ""))
                 job_url = clean_value(item.get("hostedUrl", ""))
-                
                 categories = item.get("categories", {})
                 location = categories.get("location", "UK")
-                
-                # Check for UK positions only
-                if any(non_uk in location.lower() for non_uk in ["usa", "us", "germany", "india", "berlin", "remote us"]) and "london" not in location.lower() and "united kingdom" not in location.lower() and "uk" not in location.lower():
+                if any(non_uk in location.lower() for non_uk in ["usa", "us", "germany", "india"]) and "london" not in location.lower() and "united kingdom" not in location.lower():
                     continue
-                    
                 cursor.execute("""
                 INSERT OR REPLACE INTO jobs (sponsor_id, company_name, job_title, department, location, job_url, posted_date, source, raw_id)
                 VALUES (?, ?, ?, ?, ?, ?, ?, 'Lever API', ?)
                 """, (sponsor_id, company_name, title, dept_name, location, job_url, today_str, raw_id))
                 jobs_added += 1
-                
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"[Spider] Lever crawl failed for '{company_name}': {e}")
-        
+        pass
     return jobs_added
 
-def scrape_custom_website(company_name, careers_url, sponsor_id=None):
-    """Scrapes raw job vacancies directly from a custom HTML careers page."""
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-    jobs_added = 0
-    
+def scrape_company_careers_page_smart(company_name, careers_url, sponsor_id=None):
+    """Smart Hybrid Scraper: crawls company webpage directly, auto-detects ATS scripts embeds, and falls back to anchor link extraction."""
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'}
     try:
         req = urllib.request.Request(careers_url, headers=headers)
         with urllib.request.urlopen(req, timeout=12) as response:
             html = response.read().decode('utf-8', errors='ignore')
             
-        # Parse base domain to resolve relative paths
+        # 1. Look for embedded Greenhouse script token
+        gh_matches = re.findall(r'grnh_board_token\s*=\s*[\'"]([a-zA-Z0-9_\-]+)[\'"]', html)
+        if not gh_matches:
+            gh_matches = re.findall(r'boards\.greenhouse\.io/(?:embed/job_board\?board_token=)?([a-zA-Z0-9_\-]+)', html)
+            
+        if gh_matches:
+            token = gh_matches[0]
+            print(f"[Smart Scraper] Auto-detected Greenhouse embed '{token}' for: {company_name}")
+            jobs_added = crawl_greenhouse(company_name, token, sponsor_id)
+            if jobs_added > 0:
+                return jobs_added
+                
+        # 2. Look for embedded Lever token
+        lever_matches = re.findall(r'jobs\.lever\.co/([a-zA-Z0-9_\-]+)', html)
+        if lever_matches:
+            token = lever_matches[0]
+            print(f"[Smart Scraper] Auto-detected Lever embed '{token}' for: {company_name}")
+            jobs_added = crawl_lever(company_name, token, sponsor_id)
+            if jobs_added > 0:
+                return jobs_added
+                
+        # 3. Fallback: Parse links in the raw HTML
         parsed_base = urllib.parse.urlparse(careers_url)
         base_domain = f"{parsed_base.scheme}://{parsed_base.netloc}"
         
@@ -335,19 +249,15 @@ def scrape_custom_website(company_name, careers_url, sponsor_id=None):
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
         
-        if not sponsor_id:
-            cursor.execute("SELECT id FROM sponsors WHERE organisation_name LIKE ? LIMIT 1", (f"%{company_name}%",))
-            row = cursor.fetchone()
-            sponsor_id = row[0] if row else None
-            
         seen_urls = set()
+        jobs_added = 0
         
-        # High probability job keywords
+        # High fidelity job titles and keywords dictionary
         job_keywords = ["engineer", "developer", "designer", "manager", "nurse", "analyst", "operator", "consultant", "technician", 
-                        "lead", "director", "writer", "architect", "support", "intern", "graduate", "specialist", "associate"]
+                        "lead", "director", "writer", "architect", "support", "intern", "graduate", "specialist", "associate", 
+                        "practitioner", "officer", "administrator", "head of", "recruiter", "executive"]
                         
         for href, text in anchors:
-            # Clean anchor text from HTML tags
             text_clean = re.sub(r'<[^>]+>', '', text).strip()
             text_clean = re.sub(r'\s+', ' ', text_clean)
             
@@ -355,27 +265,30 @@ def scrape_custom_website(company_name, careers_url, sponsor_id=None):
             if not href or not text_clean:
                 continue
                 
-            # Filter anchor text matching job keywords or href matching job routes
             text_lower = text_clean.lower()
             href_lower = href.lower()
             
+            # Smart filter to ensure link is an actual job role
             is_job = False
-            # Option 1: Title contains job role indicators and is relatively short (under 70 chars)
-            if len(text_clean) < 70 and any(kw in text_lower for kw in job_keywords):
-                is_job = True
-            # Option 2: The URL itself matches typical job paths
-            elif any(p in href_lower for p in ["/jobs/", "/careers/", "/vacancy/", "/openings/", "/apply/"]):
-                if len(text_clean) < 70 and len(text_clean) > 4: # sanity checks
+            # Check length to prevent pulling long paragraphs
+            if 5 < len(text_clean) < 65:
+                # Must match a known job keyword AND not be a utility navigation link
+                if any(kw in text_lower for kw in job_keywords):
                     is_job = True
-                    
-            # Skip noise and utility links
+                # Or the link path looks like an applicant tracking link
+                elif any(p in href_lower for p in ["/jobs/", "/careers/", "/vacancy/", "/openings/", "/apply/", "lever.co", "greenhouse.io"]):
+                    # Ensure it has a meaningful title
+                    if not any(noise in text_lower for noise in ["sign in", "login", "cookie", "privacy", "about us", "terms", "faq", "contact", "home", "search"]):
+                        is_job = True
+            
             if is_job:
-                if any(noise in text_lower for noise in ["sign in", "login", "cookie", "privacy", "about us", "terms", "faq", "contact", "home"]):
+                # Filter out standard navbar utility links
+                if any(noise in text_lower for noise in ["sign in", "login", "cookie", "privacy", "about us", "terms", "faq", "contact", "home", "careers", "jobs"]):
                     continue
                 if href.startswith("#") or href.startswith("javascript:") or href.startswith("tel:") or href.startswith("mailto:"):
                     continue
                     
-                # Standardize relative URLs
+                # Format relative links
                 if href.startswith("/"):
                     job_url = base_domain + href
                 elif not href.startswith("http"):
@@ -388,7 +301,7 @@ def scrape_custom_website(company_name, careers_url, sponsor_id=None):
                 seen_urls.add(job_url)
                 
                 # Make a unique raw_id
-                raw_hash = hash(job_url)
+                raw_hash = abs(hash(job_url))
                 raw_id = f"spider-{company_name.lower().replace(' ', '-')}-{raw_hash}"
                 
                 cursor.execute("""
@@ -399,10 +312,11 @@ def scrape_custom_website(company_name, careers_url, sponsor_id=None):
                 
         conn.commit()
         conn.close()
-    except Exception as e:
-        print(f"[Spider] Custom site crawl failed for '{company_name}' at '{careers_url}': {e}")
+        return jobs_added
         
-    return jobs_added
+    except Exception as e:
+        print(f"[Spider] Crawl crashed for '{company_name}' at '{careers_url}': {e}")
+    return 0
 
 # ---------------------------------------------------------------------------
 # BACKGROUND SYNC DAEMONS
@@ -416,7 +330,6 @@ def run_sponsors_sync():
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     
     try:
-        # 1. Scrape latest CSV URL
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=15) as response:
             html = response.read().decode('utf-8')
@@ -433,7 +346,6 @@ def run_sponsors_sync():
         if csv_url.startswith('/'):
             csv_url = "https://www.gov.uk" + csv_url
             
-        # 2. Check if already loaded
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
         cursor.execute("SELECT id FROM sync_history WHERE csv_url = ?", (csv_url,))
@@ -454,13 +366,12 @@ def run_sponsors_sync():
             
         reader = csv.reader(csv_data.splitlines())
         try:
-            next(reader) # skip headers
+            next(reader)
         except StopIteration:
             print("[Sync] Monolithic CSV is empty. Aborting.")
             conn.close()
             return False
             
-        # Map current active sponsors to compare incremental diffs
         cursor.execute("SELECT id, organisation_name, town_city, route, status FROM sponsors WHERE status != 'Removed'")
         active_map = {}
         for db_id, name, city, route, status in cursor.fetchall():
@@ -508,7 +419,6 @@ def run_sponsors_sync():
         if updates:
             cursor.executemany(update_sql, updates)
             
-        # Set removed status
         removed_ids = []
         for key, (db_id, _) in active_map.items():
             if db_id not in preserved_ids:
@@ -535,32 +445,58 @@ def run_sponsors_sync():
         return False
 
 def run_jobs_sync():
-    """Loops over pre-seeded ATS board mappings and fetches fresh jobs."""
+    """Daily Smart Crawl: Scrapes the actual live career webpages of mapped top companies directly, caching vacancies."""
     db_init()
-    print("[Sync] Executing daily job crawl for mapped sponsors...")
+    print("[Sync] Executing daily Smart HTML website crawl for top employers...")
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute("SELECT company_name, ats_type, ats_token FROM sponsor_ats_mappings")
-    mappings = cursor.fetchall()
+    # Scrape 50 popular visa sponsors from the register
+    cursor.execute("""
+    SELECT id, organisation_name, town_city, careers_url 
+    FROM sponsors 
+    WHERE status != 'Removed' AND (
+        organisation_name LIKE '%Monzo%' OR
+        organisation_name LIKE '%Deliveroo%' OR
+        organisation_name LIKE '%Wise%' OR
+        organisation_name LIKE '%Revolut%' OR
+        organisation_name LIKE '%Starling%' OR
+        organisation_name LIKE '%Snyk%' OR
+        organisation_name LIKE '%Skyscanner%' OR
+        organisation_name LIKE '%Gousto%' OR
+        organisation_name LIKE '%Gymshark%' OR
+        organisation_name LIKE '%DeepMind%' OR
+        organisation_name LIKE '%Octopus Energy%' OR
+        organisation_name LIKE '%Wayve%' OR
+        organisation_name LIKE '%Onfido%' OR
+        organisation_name LIKE '%ComplyAdvantage%'
+    ) LIMIT 45
+    """)
+    sponsors = cursor.fetchall()
     conn.close()
     
     total_scraped = 0
-    for company_name, ats_type, token in mappings:
-        print(f"[Scraper] Scouting jobs for: {company_name} ({ats_type})")
-        if ats_type == "greenhouse":
-            count = crawl_greenhouse(company_name, token)
-        elif ats_type == "lever":
-            count = crawl_lever(company_name, token)
-        else:
-            count = 0
+    for sp_id, name, city, careers_url in sponsors:
+        # Resolve careers URL if missing
+        if not careers_url:
+            careers_url = auto_discover_careers_url(name, city)
+            if careers_url:
+                conn = sqlite3.connect(DB_FILE)
+                cursor = conn.cursor()
+                cursor.execute("UPDATE sponsors SET careers_url = ? WHERE id = ?", (careers_url, sp_id))
+                conn.commit()
+                conn.close()
+                
+        if not careers_url:
+            continue
+            
+        print(f"[Scraper] Scouting jobs for: {name} directly from custom portal ({careers_url})")
+        count = scrape_company_careers_page_smart(name, careers_url, sp_id)
         total_scraped += count
         
-    print(f"[Scraper] Sync completed. Crawled {total_scraped} active jobs across {len(mappings)} firms.")
+    print(f"[Scraper] Smart Sync completed. Crawled {total_scraped} active jobs directly from website HTMLs.")
     return True
 
 def global_sync_daemon():
-    """Runs daily backend sync pipelines."""
-    # Execute immediately on start if database is completely dry
     db_init()
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -574,7 +510,7 @@ def global_sync_daemon():
         run_jobs_sync()
         
     while True:
-        time.sleep(24 * 3600) # sync once a day
+        time.sleep(24 * 3600)
         print("[Daemon] Executing scheduled daily database synchronization...")
         try:
             run_sponsors_sync()
@@ -588,7 +524,7 @@ def global_sync_daemon():
 
 class JobRadarHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        pass # Silence console noise
+        pass
         
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -599,7 +535,6 @@ class JobRadarHandler(http.server.BaseHTTPRequestHandler):
             self.send_json({"status": "success" if (success1 and success2) else "failed"})
             
         elif parsed.path == "/api/crawl":
-            # On-demand site crawler
             length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(length).decode('utf-8')
             params = json.loads(body) if body else {}
@@ -624,9 +559,7 @@ class JobRadarHandler(http.server.BaseHTTPRequestHandler):
             city = sponsor["town_city"]
             careers_url = sponsor["careers_url"]
             
-            # Auto discover url if missing
             if not careers_url:
-                print(f"[Crawler] Auto-discovering careers url for: {company_name}")
                 careers_url = auto_discover_careers_url(company_name, city)
                 if careers_url:
                     cursor.execute("UPDATE sponsors SET careers_url = ? WHERE id = ?", (careers_url, sponsor_id))
@@ -637,11 +570,9 @@ class JobRadarHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json({"status": "failed", "reason": "No careers page url found", "jobs": []})
                 return
                 
-            # Perform web crawl
-            print(f"[Crawler] Scraping custom webpage: {company_name} ({careers_url})")
-            jobs_added = scrape_custom_website(company_name, careers_url, sponsor_id)
+            print(f"[Crawler] Scanning company site: {company_name} ({careers_url})")
+            jobs_added = scrape_company_careers_page_smart(company_name, careers_url, sponsor_id)
             
-            # Fetch and return the newly crawled jobs
             cursor.execute("SELECT * FROM jobs WHERE sponsor_id = ? ORDER BY id DESC", (sponsor_id,))
             newly_jobs = [dict(r) for r in cursor.fetchall()]
             conn.close()
@@ -666,7 +597,6 @@ class JobRadarHandler(http.server.BaseHTTPRequestHandler):
             self.handle_static(path)
             
     def handle_static(self, path):
-        # Route static UI content
         if path == "/" or path == "/index.html":
             file_path = "index.html"
             content_type = "text/html; charset=utf-8"
@@ -683,7 +613,6 @@ class JobRadarHandler(http.server.BaseHTTPRequestHandler):
             return
             
         if not os.path.exists(file_path):
-            # Help local testing when run inside uksponsorjobs directory
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.end_headers()
@@ -702,7 +631,6 @@ class JobRadarHandler(http.server.BaseHTTPRequestHandler):
         cursor = conn.cursor()
         
         if path == "/api/jobs":
-            # Search jobs
             q = query.get("q", [""])[0].strip()
             dept = query.get("dept", [""])[0].strip()
             city = query.get("city", [""])[0].strip()
@@ -733,11 +661,9 @@ class JobRadarHandler(http.server.BaseHTTPRequestHandler):
                 
             where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
             
-            # Total matches
             cursor.execute(f"SELECT COUNT(*) FROM jobs {where_clause}", params)
             total = cursor.fetchone()[0]
             
-            # Fetch records
             cursor.execute(f"""
             SELECT * FROM jobs 
             {where_clause} 
@@ -758,7 +684,6 @@ class JobRadarHandler(http.server.BaseHTTPRequestHandler):
             })
             
         elif path == "/api/jobs/filters":
-            # Fetch distinct departments and cities to fill job search filters
             cursor.execute("SELECT DISTINCT department FROM jobs WHERE department != '' ORDER BY department ASC")
             departments = [r[0] for r in cursor.fetchall()]
             
@@ -775,7 +700,6 @@ class JobRadarHandler(http.server.BaseHTTPRequestHandler):
             })
             
         elif path == "/api/sponsors":
-            # Direct sponsor registry lookup (Sponsors tab)
             q = query.get("q", [""])[0].strip()
             city = query.get("city", [""])[0].strip()
             
@@ -835,11 +759,9 @@ class JobRadarHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(data).encode('utf-8'))
 
 def main():
-    # Start the daily database sync background daemon
     daemon = threading.Thread(target=global_sync_daemon, daemon=True)
     daemon.start()
     
-    # Run the TCP API server
     socketserver.TCPServer.allow_reuse_address = True
     with socketserver.TCPServer(("", PORT), JobRadarHandler) as httpd:
         print("==================================================")
