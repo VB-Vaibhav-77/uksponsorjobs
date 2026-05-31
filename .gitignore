@@ -1,0 +1,19 @@
+# SQLite Database (generated on startup / synced dynamically)
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Operating System files
+.DS_Store
+Thumbs.db
+
+# VS Code / IDE configs
+.vscode/
+.idea/
