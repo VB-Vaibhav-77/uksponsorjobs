@@ -90,50 +90,78 @@ def db_init():
     conn.close()
 
 # ---------------------------------------------------------------------------
-# WEB CRAWLER & SEARCH ENGINE UTILITIES
+# CAPTCHA-FREE Brand URL Auto-Resolver (Clearbit API + Probes)
 # ---------------------------------------------------------------------------
 
-def search_duckduckgo(query):
-    """Performs a search on DuckDuckGo HTML search and returns non-DDG result URLs."""
-    url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(query)
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'}
-    try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as response:
-            html = response.read().decode('utf-8', errors='ignore')
-            
-        links = re.findall(r'href="([^"]+?)"', html)
-        discovered = []
-        for link in links:
-            if "duckduckgo.com" not in link and (link.startswith("http://") or link.startswith("https://") or "/l/?kh=-1&uddg=" in link):
-                if "/l/?kh=-1&uddg=" in link:
-                    query_params = urllib.parse.parse_qs(urllib.parse.urlparse(link).query)
-                    if "uddg" in query_params:
-                        link = query_params["uddg"][0]
-                discovered.append(link)
-        return discovered
-    except Exception as e:
-        print(f"[Crawler Search] DDG Query failed for '{query}': {e}")
-        return []
+def clean_company_name_for_suggest(name):
+    """Strips complex corporate suffixes to yield perfect brand queries for autocomplete search."""
+    # Remove suffixes
+    name_clean = re.sub(r'\b(ltd|limited|plc|uk|co|group|holdings|services|bank|corporation|corp|llp|lp|assoc|intl|international)\b', '', name, flags=re.IGNORECASE)
+    # Remove symbols
+    name_clean = re.sub(r'[^a-zA-Z0-9\s]', '', name_clean)
+    name_clean = re.sub(r'\s+', ' ', name_clean).strip()
+    
+    words = name_clean.split()
+    if words:
+        # If first word is extremely short, combine with the second (e.g. "B2wise")
+        if len(words[0]) <= 2 and len(words) > 1:
+            return f"{words[0]} {words[1]}"
+        return words[0]
+    return name
 
 def auto_discover_careers_url(company_name, city):
-    """Automatically finds the career webpage for a company using DDG."""
-    query = f"{company_name} {city} UK official website careers jobs"
-    links = search_duckduckgo(query)
+    """Autocomplete Resolver: searches Clearbit, extracts official domain, and probes careers path candidates."""
+    query = clean_company_name_for_suggest(company_name)
+    url = f"https://autocomplete.clearbit.com/v1/companies/suggest?query={urllib.parse.quote(query)}"
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     
-    filtered_links = []
-    for link in links:
-        link_lower = link.lower()
-        if any(x in link_lower for x in ["facebook.com", "twitter.com", "linkedin.com", "instagram.com", "youtube.com", "gov.uk", "sponsorship", "glassdoor", "indeed", "companieshouse", "wikipedia.org"]):
-            continue
-        filtered_links.append(link)
+    domain = ""
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as response:
+            data = json.loads(response.read().decode('utf-8'))
         
-    if filtered_links:
-        for link in filtered_links:
-            if any(k in link.lower() for k in ["career", "job", "work-with-us", "vacancy", "join-us", "position"]):
-                return link
-        return filtered_links[0]
-    return ""
+        # Match closest name
+        if data:
+            for match in data:
+                m_name = match.get("name", "").lower()
+                m_domain = match.get("domain", "")
+                if query.lower() in m_name and m_domain:
+                    domain = m_domain
+                    break
+            if not domain:
+                domain = data[0].get("domain", "")
+    except Exception as e:
+        print(f"[Resolver] Clearbit Autocomplete lookup failed for '{query}': {e}")
+        
+    if not domain:
+        # Fallback basic domain parser
+        cleaned = query.lower().replace(" ", "")
+        domain = f"{cleaned}.co.uk"
+        
+    # Construct careers page candidate URLs
+    candidates = [
+        f"https://{domain}/careers",
+        f"https://{domain}/jobs",
+        f"https://{domain}/careers-at-{query.lower().replace(' ', '-')}",
+        f"https://careers.{domain}",
+        f"https://jobs.{domain}",
+        f"https://{domain}/work-with-us",
+        f"https://{domain}" # Base domain homepage
+    ]
+    
+    # Rapid HTTP Probe
+    for cand in candidates:
+        try:
+            req_probe = urllib.request.Request(cand, headers=headers)
+            with urllib.request.urlopen(req_probe, timeout=3.5) as resp:
+                if resp.status == 200:
+                    return cand
+        except Exception:
+            continue
+            
+    # Return first path candidate as default fallback
+    return f"https://{domain}/careers"
 
 # ---------------------------------------------------------------------------
 # "SPONSOR WEB RADAR" SMART CRAWLER (HYBRID HTML SPIDER)
@@ -242,7 +270,6 @@ def scrape_company_careers_page_smart(company_name, careers_url, sponsor_id=None
         parsed_base = urllib.parse.urlparse(careers_url)
         base_domain = f"{parsed_base.scheme}://{parsed_base.netloc}"
         
-        # Regex to scan all anchor links
         anchors = re.findall(r'<a\s+[^>]*?href=["\']([^"\']+)["\'][^>]*?>(.*?)</a>', html, re.IGNORECASE | re.DOTALL)
         
         today_str = datetime.date.today().isoformat()
@@ -268,27 +295,20 @@ def scrape_company_careers_page_smart(company_name, careers_url, sponsor_id=None
             text_lower = text_clean.lower()
             href_lower = href.lower()
             
-            # Smart filter to ensure link is an actual job role
             is_job = False
-            # Check length to prevent pulling long paragraphs
             if 5 < len(text_clean) < 65:
-                # Must match a known job keyword AND not be a utility navigation link
                 if any(kw in text_lower for kw in job_keywords):
                     is_job = True
-                # Or the link path looks like an applicant tracking link
                 elif any(p in href_lower for p in ["/jobs/", "/careers/", "/vacancy/", "/openings/", "/apply/", "lever.co", "greenhouse.io"]):
-                    # Ensure it has a meaningful title
                     if not any(noise in text_lower for noise in ["sign in", "login", "cookie", "privacy", "about us", "terms", "faq", "contact", "home", "search"]):
                         is_job = True
             
             if is_job:
-                # Filter out standard navbar utility links
                 if any(noise in text_lower for noise in ["sign in", "login", "cookie", "privacy", "about us", "terms", "faq", "contact", "home", "careers", "jobs"]):
                     continue
                 if href.startswith("#") or href.startswith("javascript:") or href.startswith("tel:") or href.startswith("mailto:"):
                     continue
                     
-                # Format relative links
                 if href.startswith("/"):
                     job_url = base_domain + href
                 elif not href.startswith("http"):
@@ -300,7 +320,6 @@ def scrape_company_careers_page_smart(company_name, careers_url, sponsor_id=None
                     continue
                 seen_urls.add(job_url)
                 
-                # Make a unique raw_id
                 raw_hash = abs(hash(job_url))
                 raw_id = f"spider-{company_name.lower().replace(' ', '-')}-{raw_hash}"
                 
@@ -450,7 +469,7 @@ def run_jobs_sync():
     print("[Sync] Executing daily Smart HTML website crawl for top employers...")
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    # Scrape 50 popular visa sponsors from the register
+    # Query exact premier sponsor IDs that we want to crawl
     cursor.execute("""
     SELECT id, organisation_name, town_city, careers_url 
     FROM sponsors 
@@ -469,13 +488,18 @@ def run_jobs_sync():
         organisation_name LIKE '%Wayve%' OR
         organisation_name LIKE '%Onfido%' OR
         organisation_name LIKE '%ComplyAdvantage%'
-    ) LIMIT 45
+    )
     """)
     sponsors = cursor.fetchall()
     conn.close()
     
     total_scraped = 0
     for sp_id, name, city, careers_url in sponsors:
+        # Check name and skip noise like generic builders
+        name_lower = name.lower()
+        if any(noise in name_lower for noise in ["builders", "construction", "learning", "global", "tutorials"]):
+            continue
+            
         # Resolve careers URL if missing
         if not careers_url:
             careers_url = auto_discover_careers_url(name, city)
